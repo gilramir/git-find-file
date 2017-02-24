@@ -1,0 +1,203 @@
+#!/usr/bin/env python
+
+import argparse
+import fnmatch
+import os
+import re
+import subprocess
+import sys
+
+# Key = sha1, Value = GitTree
+tree_cache = {}
+
+class GitRepo:
+    def __init__(self, repo_dir):
+        self.repo_dir = os.path.abspath(repo_dir)
+
+    def run_command(self, command, argv, env=None, stdin=None):
+        """Run an arbitrary git command in the git repo. This mirrors
+        the run_command() in the svn python module."""
+        cmdv = ["git", command] + argv
+        try:
+            return subprocess.check_output(cmdv, cwd=self.repo_dir, env=env, stderr=subprocess.STDOUT,
+                    stdin=stdin)
+        except subprocess.CalledProcessError as e:
+            sys.exit("Failed: rc=%d %s\n%s\n" % (e.returncode, " ".join(e.cmd), e.output))
+
+
+class GitObject(object):
+    def __init__(self, sha1):
+        self.sha1 = sha1
+
+    def Sha1(self):
+        return self.sha1
+
+
+class GitTree(GitObject):
+    def __init__(self, repo, sha1):
+        super(GitTree, self).__init__(sha1)
+        self.entries = []
+        for line in  repo.run_command("cat-file", ["-p", sha1]).rstrip("\n").split("\n"):
+            assert line[52] == "\t"
+            perms, type_, entry_sha1 = line[:52].split()
+            name = line[53:]
+            if type_ == "tree":
+                if entry_sha1 in tree_cache:
+                    tree = tree_cache[entry_sha1]
+                else:
+                    tree = GitTree(repo, entry_sha1)
+                    tree_cache[entry_sha1] = tree
+                git_obj = tree
+            else:
+                git_obj = GitBlob(entry_sha1)
+
+            self.entries.append(GitTreeEntry(entry_sha1, perms, type_, name, git_obj))
+
+    def AbsPaths(self, parent_path=""):
+        for entry in self.entries:
+            if entry.Type() == "blob":
+                yield os.path.join(parent_path, entry.Name())
+            elif entry.Type() == "tree":
+                this_path = os.path.join(parent_path, entry.Name())
+                for path in entry.GitObj().AbsPaths(this_path):
+                    yield path
+            else:
+                assert False
+
+
+class GitBlob(GitObject):
+    def __init__(self, sha1):
+        super(GitBlob, self).__init__(sha1)
+
+
+class GitTreeEntry:
+    def __init__(self, sha1, perms, type_, name, git_obj):
+        self.sha1 = sha1
+        self.perms = perms
+        self.type_ = type_
+        self.name = name
+        self.git_obj = git_obj
+
+    def Type(self):
+        return self.type_
+
+    def Name(self):
+        return self.name
+
+    def GitObj(self):
+        return self.git_obj
+
+
+class GitCommit(GitObject):
+    re_user_email_date = re.compile(r"(author|committer) (?P<name>[^<]*) <(?P<email>[^>]*)> " \
+        "(?P<date>\d+ [+-]\d{4})")
+    def __init__(self, repo, sha1):
+        super(GitCommit, self).__init__(sha1)
+        self.tree = None
+        self.parents = []
+        self.author_line = None
+        self.committer = None
+        self.committer_line = None
+        self.msg = ""
+
+        header = True
+        for line in repo.run_command("cat-file", ["-p", sha1]).split("\n"):
+            if header:
+                if line.startswith("tree "):
+                    tree_sha1 = line.split()[1]
+                    if tree_sha1 in tree_cache:
+                        self.tree = tree_cache[tree_sha1]
+                    else:
+                        self.tree = GitTree(repo, tree_sha1)
+                        tree_cache[tree_sha1] = self.tree
+                elif line.startswith("parent "):
+                    self.parents.append(line.split()[1])
+                elif line.startswith("author "):
+                    self.author_line = line
+                elif line.startswith("committer "):
+                    self.committer_line = line
+                elif line == "":
+                    header = False
+            else:
+                # The commit message is stored w/o a trailing \n, so we
+                # have to carefully reconstruct the message from the split lines,
+                # knowing how we split on "\n"'s
+                if self.msg == "":
+                    self.msg = line
+                else:
+                    self.msg += "\n" + line
+
+    def Tree(self):
+        return self.tree
+
+    def Parents(self):
+        return self.parents
+
+    def __repr__(self):
+        return "<GitCommit %s tree=%s parents=%s'>" % (
+            self.sha1, self.tree.Sha1(), self.parents)
+
+
+def get_all_commit_sha1s(repo):
+    """Return all the commit SHA1s on this branch, in order"""
+    argv = ["--pretty=%H"]
+    return repo.run_command("log", argv).rstrip("\n").split("\n")
+
+
+def run(file_glob, reverse_chronological, look_for_missing):
+    repo = GitRepo(os.environ.get("GIT_DIR", "."))
+
+    sha1s = get_all_commit_sha1s(repo)
+    if not reverse_chronological:
+        sha1s.reverse()
+
+    for sha1 in sha1s:
+        commit = GitCommit(repo, sha1)
+        all_paths = [p for p in commit.Tree().AbsPaths()]
+
+        if "/" in file_glob:
+            # Try full paths
+            matched = fnmatch.filter(all_paths, file_glob)
+        else:
+            # Try basenames
+            all_basenames = [os.path.basename(p) for p in all_paths]
+            matched = fnmatch.filter(all_basenames, file_glob)
+
+        if look_for_missing:
+            if not matched:
+                print "Commit %s is missing %s" % (sha1, file_glob)
+                break
+        else:
+            if any(matched):
+                for filename in matched:
+                    print "Commit %s has %s" % (sha1, filename)
+                break
+    else:
+        if look_for_missing:
+            print "All commits have", file_glob
+        else:
+            print "No commit has", file_glob
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--first", action="store_true",
+        help="Find the first commit to match")
+    parser.add_argument("--last", action="store_true",
+        help="Find the last commit to match [DEFAULT]")
+
+    parser.add_argument("--missing", action="store_true",
+        help="Find the commit which is MISSING the file")
+
+    parser.add_argument("file_glob")
+
+    args = parser.parse_args()
+
+    reverse_chronological = True
+    if args.first:
+        reverse_chronological = False
+
+    run(args.file_glob, reverse_chronological, args.missing)
+
+if __name__ == "__main__":
+    main()
